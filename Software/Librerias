@@ -1,3 +1,2 @@
-
-lib_deps =
-    adafruit/Adafruit ADS1X15@^2.5.0
+Librerías utilizadas:
+- Adafruit ADS1X15, para comunicación con el ADC externo ADS1115/ADS1015 mediante I2C.
