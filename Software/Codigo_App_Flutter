@@ -1,0 +1,1116 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+void main() {
+  runApp(const MowerRobotApp());
+}
+
+class MowerRobotApp extends StatelessWidget {
+  const MowerRobotApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'ZO-ROS Control',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: Colors.green,
+        brightness: Brightness.light,
+        scaffoldBackgroundColor: const Color(0xFFF4F7F4),
+      ),
+      home: const RobotControlScreen(),
+    );
+  }
+}
+
+enum ControlMode {
+  manual,
+  automatic,
+  stopped,
+}
+
+class RobotControlScreen extends StatefulWidget {
+  const RobotControlScreen({super.key});
+
+  @override
+  State<RobotControlScreen> createState() => _RobotControlScreenState();
+}
+
+class _RobotControlScreenState extends State<RobotControlScreen> {
+  final TextEditingController ipController =
+      TextEditingController(text: '192.168.0.20');
+
+  WebSocketChannel? channel;
+  bool connected = false;
+  String connectionText = 'Desconectado';
+
+  int selectedTab = 0;
+
+  ControlMode selectedMode = ControlMode.manual;
+
+  double maxLinear = 0.30;
+  double maxAngular = 0.85;
+
+  double currentLinear = 0.0;
+  double currentAngular = 0.0;
+
+  Timer? commandTimer;
+
+  String robotModeText = 'MANUAL';
+
+  bool bumperDer = false;
+  bool bumperFront = false;
+  bool bumperIzq = false;
+  bool bumperTras = false;
+
+  bool cuttersOn = false;
+
+  double dIzq = -1;
+  double dFront = -1;
+  double dDer = -1;
+
+  int autoElapsed = 0;
+
+  final MapController mapController = MapController();
+
+  LatLng robotPosition = const LatLng(-25.3390, -57.5190);
+  bool gpsReceived = false;
+
+  final List<LatLng> robotPath = [];
+  final List<LatLng> geofencePoints = [];
+
+  void connectToRobot() {
+    final ip = ipController.text.trim();
+    final url = 'ws://$ip:9090';
+
+    channel?.sink.close();
+
+    try {
+      channel = WebSocketChannel.connect(Uri.parse(url));
+
+      setState(() {
+        connected = true;
+        connectionText = 'Conectado a $url';
+      });
+
+      listenToRosMessages();
+      subscribeToRobotStatus();
+      subscribeToGps();
+
+      debugPrint('Conectado a $url');
+    } catch (e) {
+      setState(() {
+        connected = false;
+        connectionText = 'Error de conexión';
+      });
+
+      debugPrint('Error: $e');
+    }
+  }
+
+  void disconnectRobot() {
+    emergencyStop(sendStopMode: true);
+    channel?.sink.close();
+
+    setState(() {
+      connected = false;
+      connectionText = 'Desconectado';
+    });
+  }
+
+  void listenToRosMessages() {
+    channel!.stream.listen(
+      (event) {
+        final data = jsonDecode(event);
+
+        if (data['topic'] == '/robot/status') {
+          final msg = data['msg'];
+          if (msg == null || msg['data'] == null) return;
+
+          final statusData = jsonDecode(msg['data']);
+
+          setState(() {
+            robotModeText = statusData['mode'] ?? robotModeText;
+
+            bumperDer = statusData['bumper_der'] == 1;
+            bumperFront = statusData['bumper_front'] == 1;
+            bumperIzq = statusData['bumper_izq'] == 1;
+            bumperTras = statusData['bumper_tras'] == 1;
+
+            cuttersOn = statusData['cutters_on'] == 1;
+
+            dIzq = (statusData['d_izq'] ?? -1).toDouble();
+            dFront = (statusData['d_front'] ?? -1).toDouble();
+            dDer = (statusData['d_der'] ?? -1).toDouble();
+
+            autoElapsed = statusData['auto_elapsed'] ?? 0;
+          });
+        }
+
+        if (data['topic'] == '/robot/gps') {
+          final msg = data['msg'];
+          if (msg == null) return;
+
+          final lat = msg['latitude'];
+          final lon = msg['longitude'];
+
+          if (lat == null || lon == null) return;
+
+          final newPosition = LatLng(
+            lat.toDouble(),
+            lon.toDouble(),
+          );
+
+          setState(() {
+            robotPosition = newPosition;
+            gpsReceived = true;
+
+            if (robotPath.isEmpty || robotPath.last != newPosition) {
+              robotPath.add(newPosition);
+            }
+          });
+        }
+      },
+      onError: (_) {
+        setState(() {
+          connected = false;
+          connectionText = 'Error WebSocket';
+        });
+      },
+      onDone: () {
+        setState(() {
+          connected = false;
+          connectionText = 'Conexión cerrada';
+        });
+      },
+    );
+  }
+
+  void sendRosMessage(Map<String, dynamic> message) {
+    if (!connected || channel == null) {
+      debugPrint('No conectado');
+      return;
+    }
+
+    final jsonMessage = jsonEncode(message);
+    channel!.sink.add(jsonMessage);
+    debugPrint('Enviado: $jsonMessage');
+  }
+
+  void subscribeToRobotStatus() {
+    sendRosMessage({
+      "op": "subscribe",
+      "topic": "/robot/status",
+      "type": "std_msgs/String",
+    });
+  }
+
+  void subscribeToGps() {
+    sendRosMessage({
+      "op": "subscribe",
+      "topic": "/robot/gps",
+      "type": "sensor_msgs/NavSatFix",
+    });
+  }
+
+  void publishString(String topic, String value) {
+    sendRosMessage({
+      "op": "publish",
+      "topic": topic,
+      "msg": {"data": value},
+    });
+  }
+
+  void publishCmdVel(double linear, double angular) {
+    sendRosMessage({
+      "op": "publish",
+      "topic": "/cmd_vel",
+      "msg": {
+        "linear": {
+          "x": linear,
+          "y": 0.0,
+          "z": 0.0,
+        },
+        "angular": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": angular,
+        }
+      }
+    });
+  }
+
+  void setMode(ControlMode mode) {
+    setState(() {
+      selectedMode = mode;
+    });
+
+    if (mode == ControlMode.manual) {
+      stopSendingCommands();
+      publishString('/app/mode_cmd', 'MANUAL');
+    } else if (mode == ControlMode.automatic) {
+      stopSendingCommands();
+      publishString('/app/mode_cmd', 'AUTO');
+    } else {
+      emergencyStop(sendStopMode: true);
+    }
+  }
+
+  void toggleCutters() {
+    if (cuttersOn) {
+      publishString('/app/cutters_cmd', 'OFF');
+    } else {
+      publishString('/app/cutters_cmd', 'ON');
+    }
+  }
+
+  void startSendingCommands() {
+    if (selectedMode != ControlMode.manual) return;
+
+    commandTimer ??= Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) {
+        publishCmdVel(currentLinear, currentAngular);
+      },
+    );
+  }
+
+  void stopSendingCommands() {
+    commandTimer?.cancel();
+    commandTimer = null;
+
+    currentLinear = 0.0;
+    currentAngular = 0.0;
+
+    publishCmdVel(0.0, 0.0);
+
+    setState(() {});
+  }
+
+  void onJoystickChanged(double x, double y) {
+    if (selectedMode != ControlMode.manual) return;
+
+    currentLinear = (-y * maxLinear).clamp(-maxLinear, maxLinear);
+    currentAngular = (-x * maxAngular).clamp(-maxAngular, maxAngular);
+
+    if (connected) {
+      startSendingCommands();
+    }
+
+    setState(() {});
+  }
+
+  void emergencyStop({bool sendStopMode = false}) {
+    stopSendingCommands();
+    publishString('/app/cutters_cmd', 'OFF');
+    publishString('/app/autonomous_cmd', 'STOP');
+
+    if (sendStopMode) {
+      publishString('/app/mode_cmd', 'STOPPED');
+    }
+
+    setState(() {
+      selectedMode = ControlMode.stopped;
+    });
+  }
+
+  void addGeofencePoint(LatLng point) {
+    setState(() {
+      geofencePoints.add(point);
+    });
+  }
+
+  void clearGeofence() {
+    setState(() {
+      geofencePoints.clear();
+    });
+  }
+
+  void undoLastGeofencePoint() {
+    if (geofencePoints.isEmpty) return;
+
+    setState(() {
+      geofencePoints.removeLast();
+    });
+  }
+
+  void sendGeofenceToRos() {
+    if (geofencePoints.length < 4) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('El cerco virtual necesita al menos 4 puntos.'),
+        ),
+      );
+      return;
+    }
+
+    final points = geofencePoints.map((p) {
+      return {
+        "lat": p.latitude,
+        "lon": p.longitude,
+      };
+    }).toList();
+
+    final payload = jsonEncode({
+      "points": points,
+    });
+
+    publishString('/app/geofence', payload);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Cerco virtual enviado a ROS2.'),
+      ),
+    );
+  }
+
+  void centerMapOnRobot() {
+    mapController.move(robotPosition, 18);
+  }
+
+  void clearPath() {
+    setState(() {
+      robotPath.clear();
+    });
+  }
+
+  @override
+  void dispose() {
+    commandTimer?.cancel();
+    channel?.sink.close();
+    ipController.dispose();
+    super.dispose();
+  }
+
+  Widget connectionMenu() {
+    return Card(
+      elevation: 2,
+      child: ExpansionTile(
+        leading: Icon(
+          connected ? Icons.wifi : Icons.wifi_off,
+          color: connected ? Colors.green : Colors.red,
+        ),
+        title: const Text(
+          'Conexión Raspberry',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        subtitle: Text(connectionText),
+        childrenPadding: const EdgeInsets.all(12),
+        children: [
+          TextField(
+            controller: ipController,
+            decoration: const InputDecoration(
+              labelText: 'IP de la Raspberry',
+              hintText: 'Ejemplo: 192.168.0.20',
+              border: OutlineInputBorder(),
+              prefixIcon: Icon(Icons.router),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: connectToRobot,
+                  icon: const Icon(Icons.link),
+                  label: const Text('Conectar'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: connected ? disconnectRobot : null,
+                  icon: const Icon(Icons.link_off),
+                  label: const Text('Desconectar'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget modeSelector() {
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.tune),
+                SizedBox(width: 8),
+                Text(
+                  'Modo de operación',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            SegmentedButton<ControlMode>(
+              segments: const [
+                ButtonSegment(
+                  value: ControlMode.manual,
+                  label: Text('Manual'),
+                  icon: Icon(Icons.sports_esports),
+                ),
+                ButtonSegment(
+                  value: ControlMode.automatic,
+                  label: Text('Auto'),
+                  icon: Icon(Icons.autorenew),
+                ),
+                ButtonSegment(
+                  value: ControlMode.stopped,
+                  label: Text('Stop'),
+                  icon: Icon(Icons.stop_circle),
+                ),
+              ],
+              selected: {selectedMode},
+              onSelectionChanged: connected
+                  ? (selection) {
+                      setMode(selection.first);
+                    }
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Modo reportado por ESP32: $robotModeText',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            if (robotModeText == 'AUTO')
+              Text('Tiempo automático: $autoElapsed s / 60 s'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget speedMenu() {
+    return Card(
+      elevation: 2,
+      child: ExpansionTile(
+        leading: const Icon(Icons.speed),
+        title: const Text(
+          'Configuración de velocidad',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        subtitle: Text(
+          'Lineal ${maxLinear.toStringAsFixed(2)} | Angular ${maxAngular.toStringAsFixed(2)}',
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+        children: [
+          Text('Velocidad lineal máxima: ${maxLinear.toStringAsFixed(2)}'),
+          Slider(
+            value: maxLinear,
+            min: 0.10,
+            max: 0.60,
+            divisions: 10,
+            label: maxLinear.toStringAsFixed(2),
+            onChanged: selectedMode == ControlMode.manual
+                ? (value) {
+                    setState(() {
+                      maxLinear = value;
+                    });
+                  }
+                : null,
+          ),
+          Text('Velocidad angular máxima: ${maxAngular.toStringAsFixed(2)}'),
+          Slider(
+            value: maxAngular,
+            min: 0.30,
+            max: 1.50,
+            divisions: 12,
+            label: maxAngular.toStringAsFixed(2),
+            onChanged: selectedMode == ControlMode.manual
+                ? (value) {
+                    setState(() {
+                      maxAngular = value;
+                    });
+                  }
+                : null,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Linear: ${currentLinear.toStringAsFixed(2)}   Angular: ${currentAngular.toStringAsFixed(2)}',
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget bumperBox(String label, bool active) {
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 3),
+        padding: const EdgeInsets.symmetric(vertical: 9),
+        decoration: BoxDecoration(
+          color: active ? Colors.red : Colors.green,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Column(
+          children: [
+            Icon(
+              active ? Icons.warning_amber : Icons.check_circle,
+              color: Colors.white,
+              size: 20,
+            ),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget statusPanel() {
+    final anyBumper = bumperDer || bumperFront || bumperIzq || bumperTras;
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Icon(
+                  anyBumper ? Icons.error : Icons.verified,
+                  color: anyBumper ? Colors.red : Colors.green,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    anyBumper
+                        ? 'Bumper activado - movimiento bloqueado'
+                        : 'Bumpers libres',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: anyBumper
+                          ? Colors.red.shade900
+                          : Colors.green.shade900,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                bumperBox('IZQ', bumperIzq),
+                bumperBox('FRONT', bumperFront),
+                bumperBox('DER', bumperDer),
+                bumperBox('TRAS', bumperTras),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                sensorChip('US IZQ', dIzq),
+                sensorChip('US FRONT', dFront),
+                sensorChip('US DER', dDer),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget sensorChip(String label, double value) {
+    final text = value < 0 ? 'Sin eco' : '${value.toStringAsFixed(0)} cm';
+
+    return Expanded(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 3),
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Colors.blueGrey.shade50,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.blueGrey.shade100),
+        ),
+        child: Column(
+          children: [
+            Text(
+              label,
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 3),
+            Text(text),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget cuttersButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 52,
+      child: FilledButton.icon(
+        style: FilledButton.styleFrom(
+          backgroundColor: cuttersOn ? Colors.orange.shade800 : Colors.blueGrey,
+        ),
+        onPressed: connected ? toggleCutters : null,
+        icon: Icon(cuttersOn ? Icons.power_settings_new : Icons.cut),
+        label: Text(
+          cuttersOn
+              ? 'Apagar brushless inferiores'
+              : 'Encender brushless inferiores',
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+      ),
+    );
+  }
+
+  Widget joystickPanel() {
+    final joystickEnabled =
+        connected && selectedMode == ControlMode.manual && robotModeText != 'AUTO';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black12,
+            blurRadius: 12,
+            offset: Offset(0, -3),
+          ),
+        ],
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(22),
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            joystickEnabled ? 'Joystick manual' : 'Joystick deshabilitado',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: joystickEnabled ? Colors.green.shade900 : Colors.grey,
+            ),
+          ),
+          const SizedBox(height: 6),
+          VirtualJoystick(
+            enabled: joystickEnabled,
+            onChanged: onJoystickChanged,
+            onReleased: stopSendingCommands,
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 54,
+            width: double.infinity,
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.red,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: connected ? () => emergencyStop(sendStopMode: true) : null,
+              icon: const Icon(Icons.stop),
+              label: const Text(
+                'STOP GENERAL',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget controlTab() {
+    return Column(
+      children: [
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.all(12),
+            children: [
+              connectionMenu(),
+              modeSelector(),
+              statusPanel(),
+              cuttersButton(),
+              const SizedBox(height: 8),
+              speedMenu(),
+              const SizedBox(height: 90),
+            ],
+          ),
+        ),
+        joystickPanel(),
+      ],
+    );
+  }
+
+  Widget mapTab() {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(10),
+          color: Colors.white,
+          child: Row(
+            children: [
+              Icon(
+                gpsReceived ? Icons.gps_fixed : Icons.gps_off,
+                color: gpsReceived ? Colors.green : Colors.red,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  gpsReceived
+                      ? 'GPS: ${robotPosition.latitude.toStringAsFixed(6)}, ${robotPosition.longitude.toStringAsFixed(6)}'
+                      : 'GPS no recibido. Publica /robot/gps para probar.',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: FlutterMap(
+            mapController: mapController,
+            options: MapOptions(
+              initialCenter: robotPosition,
+              initialZoom: 18,
+              onTap: (tapPosition, point) {
+                addGeofencePoint(point);
+              },
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.mower_robot_app',
+              ),
+              if (robotPath.length > 1)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: robotPath,
+                      strokeWidth: 4,
+                      color: Colors.blue,
+                    ),
+                  ],
+                ),
+              if (geofencePoints.length >= 3)
+                PolygonLayer(
+                  polygons: [
+                    Polygon(
+                      points: geofencePoints,
+                      color: Colors.green.withOpacity(0.25),
+                      borderColor: Colors.green,
+                      borderStrokeWidth: 3,
+                    ),
+                  ],
+                ),
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: robotPosition,
+                    width: 54,
+                    height: 54,
+                    child: const Icon(
+                      Icons.smart_toy,
+                      color: Colors.red,
+                      size: 42,
+                    ),
+                  ),
+                  ...geofencePoints.asMap().entries.map(
+                    (entry) {
+                      final index = entry.key + 1;
+                      final point = entry.value;
+
+                      return Marker(
+                        point: point,
+                        width: 42,
+                        height: 42,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            const Icon(
+                              Icons.location_on,
+                              color: Colors.green,
+                              size: 40,
+                            ),
+                            Positioned(
+                              top: 4,
+                              child: Text(
+                                '$index',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.all(10),
+          color: Colors.white,
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Puntos del cerco: ${geofencePoints.length}',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  Text(
+                    geofencePoints.length >= 4 ? 'Polígono válido' : 'Mínimo 4 puntos',
+                    style: TextStyle(
+                      color: geofencePoints.length >= 4 ? Colors.green : Colors.red,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: centerMapOnRobot,
+                      icon: const Icon(Icons.my_location),
+                      label: const Text('Centrar'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: undoLastGeofencePoint,
+                      icon: const Icon(Icons.undo),
+                      label: const Text('Deshacer'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: clearGeofence,
+                      icon: const Icon(Icons.delete),
+                      label: const Text('Borrar'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: connected ? sendGeofenceToRos : null,
+                      icon: const Icon(Icons.send),
+                      label: const Text('Enviar cerco'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: clearPath,
+                      icon: const Icon(Icons.timeline),
+                      label: const Text('Limpiar ruta'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tabs = [
+      controlTab(),
+      mapTab(),
+    ];
+
+    return Scaffold(
+      resizeToAvoidBottomInset: true,
+      appBar: AppBar(
+        title: const Text('ZO-ROS Control'),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            onPressed: connected ? () => emergencyStop(sendStopMode: true) : null,
+            icon: const Icon(Icons.emergency),
+            tooltip: 'STOP general',
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: tabs[selectedTab],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: selectedTab,
+        onDestinationSelected: (index) {
+          setState(() {
+            selectedTab = index;
+          });
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.sports_esports),
+            label: 'Control',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.map),
+            label: 'Mapa',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class VirtualJoystick extends StatefulWidget {
+  final bool enabled;
+  final void Function(double x, double y) onChanged;
+  final VoidCallback onReleased;
+
+  const VirtualJoystick({
+    super.key,
+    required this.enabled,
+    required this.onChanged,
+    required this.onReleased,
+  });
+
+  @override
+  State<VirtualJoystick> createState() => _VirtualJoystickState();
+}
+
+class _VirtualJoystickState extends State<VirtualJoystick> {
+  Offset knobOffset = Offset.zero;
+
+  static const double size = 210;
+  static const double knobSize = 78;
+  static const double radius = size / 2;
+  static const double maxDistance = radius - knobSize / 2;
+
+  void updateJoystick(Offset localPosition) {
+    if (!widget.enabled) return;
+
+    final center = const Offset(radius, radius);
+    Offset delta = localPosition - center;
+
+    if (delta.distance > maxDistance) {
+      delta = Offset.fromDirection(delta.direction, maxDistance);
+    }
+
+    final normalizedX = delta.dx / maxDistance;
+    final normalizedY = delta.dy / maxDistance;
+
+    setState(() {
+      knobOffset = delta;
+    });
+
+    widget.onChanged(normalizedX, normalizedY);
+  }
+
+  void releaseJoystick() {
+    setState(() {
+      knobOffset = Offset.zero;
+    });
+
+    widget.onReleased();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final baseColor =
+        widget.enabled ? Colors.green.shade100 : Colors.grey.shade200;
+    final borderColor =
+        widget.enabled ? Colors.green.shade700 : Colors.grey.shade400;
+    final knobColor = widget.enabled ? Colors.green.shade800 : Colors.grey;
+
+    return Listener(
+      onPointerDown: (event) {
+        final box = context.findRenderObject() as RenderBox;
+        final local = box.globalToLocal(event.position);
+        updateJoystick(local);
+      },
+      onPointerMove: (event) {
+        final box = context.findRenderObject() as RenderBox;
+        final local = box.globalToLocal(event.position);
+        updateJoystick(local);
+      },
+      onPointerUp: (_) => releaseJoystick(),
+      onPointerCancel: (_) => releaseJoystick(),
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: baseColor,
+                border: Border.all(
+                  color: borderColor,
+                  width: 3,
+                ),
+              ),
+              child: const Center(
+                child: Icon(
+                  Icons.control_camera,
+                  size: 44,
+                  color: Colors.black38,
+                ),
+              ),
+            ),
+            Transform.translate(
+              offset: knobOffset,
+              child: Container(
+                width: knobSize,
+                height: knobSize,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: knobColor,
+                  boxShadow: const [
+                    BoxShadow(
+                      blurRadius: 10,
+                      spreadRadius: 1,
+                      offset: Offset(0, 4),
+                      color: Colors.black26,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
